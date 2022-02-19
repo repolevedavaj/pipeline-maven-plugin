@@ -30,7 +30,6 @@ import javax.inject.Inject;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
-import java.util.logging.Level;
 import java.util.stream.Collectors;
 
 /**
@@ -59,7 +58,7 @@ public class DownstreamPipelineTriggerRunListener extends RunListener<WorkflowRu
             return;
         }
 
-        if (hasInfiniteLoop(upstreamBuild)) {
+        if (isInfiniteLoop(upstreamBuild)) {
             logInfoMessage(listener, "[withMaven] WARNING abort infinite build trigger loop. Please consider opening a Jira issue");
             return;
         }
@@ -77,7 +76,7 @@ public class DownstreamPipelineTriggerRunListener extends RunListener<WorkflowRu
         }
     }
 
-    private boolean hasInfiniteLoop(WorkflowRun upstreamBuild) {
+    private boolean isInfiniteLoop(WorkflowRun upstreamBuild) {
         try {
             this.globalPipelineMavenConfig.getPipelineTriggerService().checkNoInfiniteLoopOfUpstreamCause(upstreamBuild);
 
@@ -175,9 +174,9 @@ public class DownstreamPipelineTriggerRunListener extends RunListener<WorkflowRu
 
     private Pair<Map<String, Set<MavenArtifact>>, Map<String, Set<String>>> collectPipelinesToTrigger(WorkflowRun upstreamBuild, TaskListener listener) {
         WorkflowJob upstreamPipeline = upstreamBuild.getParent();
-
         String upstreamPipelineFullName = upstreamPipeline.getFullName();
         int upstreamBuildNumber = upstreamBuild.getNumber();
+
         Map<MavenArtifact, SortedSet<String>> downstreamPipelinesByArtifact = globalPipelineMavenConfig.getDao().listDownstreamJobsByArtifact(upstreamPipelineFullName, upstreamBuildNumber);
         logDebugMessage("got downstreamPipelinesByArtifact for project {} and build #{}: {}", upstreamPipelineFullName, upstreamBuildNumber, downstreamPipelinesByArtifact);
 
@@ -186,6 +185,7 @@ public class DownstreamPipelineTriggerRunListener extends RunListener<WorkflowRu
         List<String> rejectedPipelines = new ArrayList<>();
 
         // build the list of pipelines to trigger
+        // TODO: Why not just loop through all downstream pipelines and add all artifacts as causes? This would prevent having to check whether a pipeline has already been checked..
         for (Map.Entry<MavenArtifact, SortedSet<String>> entry : downstreamPipelinesByArtifact.entrySet()) {
 
             MavenArtifact mavenArtifact = entry.getKey();
@@ -229,7 +229,7 @@ public class DownstreamPipelineTriggerRunListener extends RunListener<WorkflowRu
                     continue;
                 }
 
-                if (isInfiniteLoop(listener, upstreamPipeline, upstreamPipelineFullName, mavenArtifact, downstreamPipelineFullName, downstreamPipeline, downstreamBuildNumber)) {
+                if (willTriggerUpstreamPipeline(listener, upstreamPipeline, upstreamPipelineFullName, mavenArtifact, downstreamPipelineFullName, downstreamPipeline, downstreamBuildNumber)) {
                     rejectedPipelines.add(downstreamPipelineFullName);
                     continue;
                 }
@@ -380,7 +380,7 @@ public class DownstreamPipelineTriggerRunListener extends RunListener<WorkflowRu
         return null;
     }
 
-    private boolean isInfiniteLoop(TaskListener listener, WorkflowJob upstreamPipeline, String upstreamPipelineFullName, MavenArtifact mavenArtifact, String downstreamPipelineFullName, WorkflowJob downstreamPipeline, int downstreamBuildNumber) {
+    private boolean willTriggerUpstreamPipeline(TaskListener listener, WorkflowJob upstreamPipeline, String upstreamPipelineFullName, MavenArtifact mavenArtifact, String downstreamPipelineFullName, WorkflowJob downstreamPipeline, int downstreamBuildNumber) {
         Map<MavenArtifact, SortedSet<String>> downstreamDownstreamPipelinesByArtifact = globalPipelineMavenConfig.getDao().listDownstreamJobsByArtifact(downstreamPipelineFullName, downstreamBuildNumber);
         for (Map.Entry<MavenArtifact, SortedSet<String>> entry2 : downstreamDownstreamPipelinesByArtifact.entrySet()) {
             SortedSet<String> downstreamDownstreamPipelines = entry2.getValue();
@@ -435,11 +435,8 @@ public class DownstreamPipelineTriggerRunListener extends RunListener<WorkflowRu
     }
 
     private boolean isSamePipeline(String upstreamPipelineFullName, String downstreamPipelineFullName) {
-        if (Objects.equals(downstreamPipelineFullName, upstreamPipelineFullName)) {
-            // Don't trigger myself
-            return true;
-        }
-        return false;
+        // Don't trigger myself
+        return Objects.equals(downstreamPipelineFullName, upstreamPipelineFullName);
     }
 
     private void triggerPipelines(Map<String, Set<MavenArtifact>> jobsToTrigger, Map<String, Set<String>> omittedPipelineTriggersByPipelineFullname, WorkflowRun upstreamBuild, TaskListener listener) {
