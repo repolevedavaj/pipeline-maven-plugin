@@ -183,6 +183,7 @@ public class DownstreamPipelineTriggerRunListener extends RunListener<WorkflowRu
 
         Map<String, Set<MavenArtifact>> jobsToTrigger = new TreeMap<>();
         Map<String, Set<String>> omittedPipelineTriggersByPipelineFullname = new HashMap<>();
+        List<String> rejectedPipelines = new ArrayList<>();
 
         // build the list of pipelines to trigger
         for (Map.Entry<MavenArtifact, SortedSet<String>> entry : downstreamPipelinesByArtifact.entrySet()) {
@@ -210,30 +211,49 @@ public class DownstreamPipelineTriggerRunListener extends RunListener<WorkflowRu
                     continue;
                 }
 
+                if (hasAlreadyBeenChecked(omittedPipelineTriggersByPipelineFullname, rejectedPipelines, downstreamPipelineFullName)) {
+                    logDebugMessage("Downstream pipeline {0} already checked", downstreamPipelineFullName);
+                    continue;
+                }
+
                 final WorkflowJob downstreamPipeline = Jenkins.get().getItemByFullName(downstreamPipelineFullName, WorkflowJob.class);
                 if (doesNotExists(upstreamBuild, downstreamPipelineFullName, downstreamPipeline)) {
+                    rejectedPipelines.add(downstreamPipelineFullName);
                     continue;
                 }
 
                 int downstreamBuildNumber = downstreamPipeline.getLastBuild().getNumber();
 
                 if (generatesSameArtifact(listener, mavenArtifact, downstreamPipelineFullName, downstreamPipeline, downstreamBuildNumber)) {
+                    rejectedPipelines.add(downstreamPipelineFullName);
                     continue;
                 }
 
                 if (isInfiniteLoop(listener, upstreamPipeline, upstreamPipelineFullName, mavenArtifact, downstreamPipelineFullName, downstreamPipeline, downstreamBuildNumber)) {
+                    rejectedPipelines.add(downstreamPipelineFullName);
                     continue;
                 }
 
-                if (isExcessiveTriggering(listener, upstreamPipeline, omittedPipelineTriggersByPipelineFullname, downstreamPipelines, downstreamPipelineFullName, downstreamPipeline, downstreamBuildNumber)) {
+                Map<String, Integer> transitiveUpstreamPipelines = globalPipelineMavenConfig.getDao().listTransitiveUpstreamJobs(downstreamPipelineFullName, downstreamBuildNumber);
+
+                if (isExcessiveTriggering(transitiveUpstreamPipelines, listener, upstreamPipeline, omittedPipelineTriggersByPipelineFullname, downstreamPipelines, downstreamPipelineFullName, downstreamPipeline, downstreamBuildNumber)) {
+                    rejectedPipelines.add(downstreamPipelineFullName);
+                    continue;
+                }
+
+                String transitiveUpstreamPipelineName = willBeTriggeredByDownstreamPipeline(transitiveUpstreamPipelines, listener, upstreamPipeline, omittedPipelineTriggersByPipelineFullname, downstreamPipelines, downstreamPipelineFullName, downstreamPipeline, downstreamBuildNumber);
+                if (transitiveUpstreamPipelineName != null) {
+                    omittedPipelineTriggersByPipelineFullname.computeIfAbsent(transitiveUpstreamPipelineName, p -> new TreeSet<>()).add(downstreamPipelineFullName);
                     continue;
                 }
 
                 if (isNotBuildable(upstreamBuild, downstreamPipeline)) {
+                    rejectedPipelines.add(downstreamPipelineFullName);
                     continue;
                 }
 
                 if (hasNoTrigger(upstreamBuild, downstreamPipeline)) {
+                    rejectedPipelines.add(downstreamPipelineFullName);
                     continue;
                 }
 
@@ -242,6 +262,18 @@ public class DownstreamPipelineTriggerRunListener extends RunListener<WorkflowRu
         }
 
         return Pair.of(jobsToTrigger, omittedPipelineTriggersByPipelineFullname);
+    }
+
+    private boolean hasAlreadyBeenChecked(Map<String, Set<String>> omittedPipelineTriggersByPipelineFullname, List<String> rejectedPipelines, String downstreamPipelineFullName) {
+        if (rejectedPipelines.contains(downstreamPipelineFullName)) {
+            return true;
+        }
+
+        if (omittedPipelineTriggersByPipelineFullname.values().stream().anyMatch(set -> set.contains(downstreamPipelineFullName))) {
+            return true;
+        }
+
+        return false;
     }
 
     private void addToJobsToTrigger(WorkflowRun upstreamBuild, WorkflowJob upstreamPipeline, String upstreamPipelineFullName, Map<String, Set<MavenArtifact>> jobsToTrigger, MavenArtifact mavenArtifact, String downstreamPipelineFullName, WorkflowJob downstreamPipeline) {
@@ -295,10 +327,9 @@ public class DownstreamPipelineTriggerRunListener extends RunListener<WorkflowRu
         return false;
     }
 
-    private boolean isExcessiveTriggering(TaskListener listener, WorkflowJob upstreamPipeline, Map<String, Set<String>> omittedPipelineTriggersByPipelineFullname, SortedSet<String> downstreamPipelines, String downstreamPipelineFullName, WorkflowJob downstreamPipeline, int downstreamBuildNumber) {
+    private boolean isExcessiveTriggering(Map<String, Integer> transitiveUpstreamPipelines, TaskListener listener, WorkflowJob upstreamPipeline, Map<String, Set<String>> omittedPipelineTriggersByPipelineFullname, SortedSet<String> downstreamPipelines, String downstreamPipelineFullName, WorkflowJob downstreamPipeline, int downstreamBuildNumber) {
         // Avoid excessive triggering
         // See #46313
-        Map<String, Integer> transitiveUpstreamPipelines = globalPipelineMavenConfig.getDao().listTransitiveUpstreamJobs(downstreamPipelineFullName, downstreamBuildNumber);
         for (String transitiveUpstreamPipelineName : transitiveUpstreamPipelines.keySet()) {
             // Skip if one of the downstream's upstream is already building or in queue
             // Then it will get triggered anyway by that upstream, we don't need to trigger it again
@@ -324,7 +355,17 @@ public class DownstreamPipelineTriggerRunListener extends RunListener<WorkflowRu
                 );
 
                 return true;
-            } else if (downstreamPipelines.contains(transitiveUpstreamPipelineName)) {
+            }
+        }
+
+        return false;
+    }
+
+    private String willBeTriggeredByDownstreamPipeline(Map<String, Integer> transitiveUpstreamPipelines, TaskListener listener, WorkflowJob upstreamPipeline, Map<String, Set<String>> omittedPipelineTriggersByPipelineFullname, SortedSet<String> downstreamPipelines, String downstreamPipelineFullName, WorkflowJob downstreamPipeline, int downstreamBuildNumber) {
+        for (String transitiveUpstreamPipelineName : transitiveUpstreamPipelines.keySet()) {
+            WorkflowJob transitiveUpstreamPipeline = Jenkins.get().getItemByFullName(transitiveUpstreamPipelineName, WorkflowJob.class);
+
+            if (downstreamPipelines.contains(transitiveUpstreamPipelineName)) {
                 // Skip if this downstream pipeline will be triggered by another one of our downstream pipelines
                 // That's the case when one of the downstream's transitive upstream is our own downstream
                 logInfoMessage(listener, "[withMaven] downstreamPipelineTriggerRunListener - Skip triggering {} because it has a dependency on a pipeline that will be triggered by this build: {}",
@@ -332,12 +373,11 @@ public class DownstreamPipelineTriggerRunListener extends RunListener<WorkflowRu
                         ModelHyperlinkNote.encodeTo(transitiveUpstreamPipeline)
                 );
 
-                omittedPipelineTriggersByPipelineFullname.computeIfAbsent(transitiveUpstreamPipelineName, p -> new TreeSet<>()).add(downstreamPipelineFullName);
-                return true;
+                return transitiveUpstreamPipelineName;
             }
         }
 
-        return false;
+        return null;
     }
 
     private boolean isInfiniteLoop(TaskListener listener, WorkflowJob upstreamPipeline, String upstreamPipelineFullName, MavenArtifact mavenArtifact, String downstreamPipelineFullName, WorkflowJob downstreamPipeline, int downstreamBuildNumber) {
